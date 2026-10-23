@@ -1,0 +1,105 @@
+# Copy this file to config.toml and fill it in; Git ignores the local config.toml.
+# Never commit real API keys, client secrets, or access tokens in this example.
+# Offline check: .venv/bin/python llm_connection_test.py --check-config
+# Normal runs call models and may incur charges; start with one model and scenario.
+
+[llm]
+# Replace YOUR-RESOURCE, or use another OpenAI-compatible HTTPS API base URL.
+# The protocol determines the path; full /chat/completions or /responses URLs also work.
+endpoint = "https://YOUR-RESOURCE.openai.azure.com/openai/v1"
+# chat_completions, responses, or both; both tests each protocol and adds requests.
+protocol = "chat_completions"
+# Use actual model names; on Azure, use deployment names, not necessarily model names.
+# Multiple deployments are supported, for example ["deployment-a", "deployment-b"].
+models = ["YOUR-MODEL-DEPLOYMENT"]
+# auto tries Managed Identity -> App Registration -> API Key in that order.
+# To use one method, select azure_managed_identity, azure_app_registration, or api_key.
+# Fallback handles missing credentials or token acquisition/refresh failures, not HTTP 401/403.
+auth_type = "auto"
+# Name of the environment variable used for API Key authentication or the final auto fallback.
+# Set LLM_API_KEY in your shell; do not configure both llm.api_key and llm.api_key_env.
+api_key_env = "LLM_API_KEY"
+# These two settings apply only to API keys; defaults send Authorization: Bearer <key>.
+# For an api-key header, use auth_header = "api-key" and auth_scheme = "".
+# Azure identity authentication always uses a Bearer token and ignores these settings.
+auth_header = "Authorization"
+auth_scheme = "Bearer"
+# Time limit for a single model HTTP request, in seconds.
+timeout_seconds = 120
+
+[azure_auth]
+# Target resource scope for Azure tokens; follow the service requirements and end with /.default.
+scope = "https://cognitiveservices.azure.com/.default"
+# Managed Identity only: leave empty for system-assigned identity, or set a user-assigned Client ID.
+# This is independent of the App Registration client_id below; do not mix them up.
+managed_identity_client_id = ""
+# App Registration only: use these environment references or enter tenant/application IDs locally.
+# Set AZURE_TENANT_ID, AZURE_CLIENT_ID, and AZURE_CLIENT_SECRET before running.
+# auto skips this method if credentials are missing; explicit App Registration mode reports an error.
+tenant_id = "${AZURE_TENANT_ID}"
+client_id = "${AZURE_CLIENT_ID}"
+# Environment variable name, not the secret itself; use the secret value, not its Secret ID.
+# For temporary local plaintext testing, remove this setting and use client_secret = "temporary secret".
+# Use either client_secret or client_secret_env; grant the app inference access to the target resource.
+client_secret_env = "AZURE_CLIENT_SECRET"
+
+[benchmark]
+# Measured rounds for each model/protocol/response-mode/scenario combination; must be positive.
+rounds = 3
+# true continues after a failed round; failures remain failures in the report.
+continue_on_error = true
+# streaming, non_streaming, or both; both alternates order for paired comparisons.
+# Non-streaming has no measurable TTFT, TTLT, decode TPS, or client prefill proxy.
+mode = "both"
+# Select one or more scenarios; only the listed scenarios run.
+# baseline: use the request prompts below for baseline measurements.
+# prefill_short / prefill_long: compare short/long inputs; the client proxy is not server prefill.
+# long_output: require more than 1000 visible output tokens.
+# short_burst: sequential independent requests; short_conversation: growing conversation history.
+# Both short-output scenarios require fewer than 200 visible tokens per request, with no added delays.
+# agent: local tool calls; agent_serial / agent_parallel: serial/parallel sub-agents.
+# Agent scenarios require model and endpoint tool-call support; see README.md for scenario details.
+scenarios = ["baseline"]
+# Allow sequential requests to reuse connections; false measures repeated connection setup.
+connection_reuse = true
+# Full-scenario warmup rounds per combination; may be 0; warmups also call models and incur charges.
+warmup_rounds = 1
+# Task time limit per scenario round, in seconds; short-request batches and agents share this deadline.
+task_timeout_seconds = 600
+# Leave empty to select by tested model name; for aliases, use a verified compatible underlying model.
+# Unknown tokenizers use a labelled heuristic estimate, which cannot prove strict output-length checks.
+tokenizer_model = ""
+
+[scenarios]
+# Sequential requests per short_burst / short_conversation round.
+short_requests = 20
+# Per-request generation budget for short outputs; may include hidden reasoning, not just visible text.
+# A budget of 1024 does not allow 200 or more visible tokens; actual output is checked separately.
+short_token_budget = 1024
+# Long-output generation budget; a large limit does not guarantee more than 1000 visible output tokens.
+long_token_budget = 8192
+# Synthetic input sizes for prefill_short / prefill_long, measured in words, not tokens.
+prefill_short_words = 128
+prefill_long_words = 4096
+
+[agents]
+# Maximum steps for each agent individually, including the parent and each sub-agent.
+max_steps = 4
+# Model-call limit for the whole task, shared by the parent and all sub-agents.
+max_calls = 12
+# Generation budget per agent model request; may include hidden reasoning and tool-call tokens.
+token_budget = 1024
+# Shared generation budget for the whole task, including the parent and all sub-agents.
+total_token_budget = 12288
+
+[request]
+# System prompt used across all scenarios; customize for your tests.
+system_prompt = "You are a helpful assistant."
+# User prompt for baseline; other scenarios construct their own inputs.
+user_prompt = "Explain how to measure language model latency and throughput."
+# Baseline generation budget; may include hidden reasoning and does not guarantee visible output length.
+# Traditional Chat models may use max_tokens instead, but never set both options.
+# Responses maps this setting to max_output_tokens.
+max_completion_tokens = 256
+# Request usage in Chat streaming responses; Responses reads usage from the response object.
+include_usage = true

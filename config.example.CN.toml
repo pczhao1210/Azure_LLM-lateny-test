@@ -1,0 +1,105 @@
+# 复制为 config.toml 后填写；本地 config.toml 已被 Git 忽略。
+# 不要把真实密钥、Secret 或访问令牌写入本示例并提交。
+# 离线检查：.venv/bin/python llm_connection_test.py --check-config
+# 正常运行会调用模型并可能产生费用；建议先用一个模型、一个场景测试。
+
+[llm]
+# 替换 YOUR-RESOURCE；也可填写其他兼容 OpenAI 的 HTTPS API 基础地址。
+# 程序按 protocol 补齐路径；已有完整 /chat/completions 或 /responses 地址也支持。
+endpoint = "https://YOUR-RESOURCE.openai.azure.com/openai/v1"
+# chat_completions、responses 或 both；both 会分别测试两种协议，增加请求数量。
+protocol = "chat_completions"
+# 替换为实际模型名称；Azure 填部署名称，不一定等于模型的官方名称。
+# 可填写多个，例如 ["deployment-a", "deployment-b"]。
+models = ["YOUR-MODEL-DEPLOYMENT"]
+# auto：依次尝试 Managed Identity → App Registration → API Key。
+# 也可固定为 azure_managed_identity、azure_app_registration 或 api_key。
+# auto 仅在凭据缺失或取/刷新 Token 失败时回退；接口 HTTP 401/403 不切换身份。
+auth_type = "auto"
+# API Key 模式或 auto 最后回退时读取的环境变量名，不是密钥本身。
+# 在终端设置 LLM_API_KEY；不要同时配置 llm.api_key 和 llm.api_key_env。
+api_key_env = "LLM_API_KEY"
+# 以下两项仅用于 API Key；默认发送 Authorization: Bearer <key>。
+# 若服务要求 api-key 请求头，改为 auth_header = "api-key"、auth_scheme = ""。
+# Azure 身份认证固定发送 Bearer Token，不使用这两项设置。
+auth_header = "Authorization"
+auth_scheme = "Bearer"
+# 单次模型 HTTP 请求时限，单位秒。
+timeout_seconds = 120
+
+[azure_auth]
+# Azure Token 的目标 scope；按目标服务要求填写，必须以 /.default 结尾。
+scope = "https://cognitiveservices.azure.com/.default"
+# Managed Identity 专用：留空使用系统分配身份；用户分配身份填写其 Client ID。
+# 该值与下面 App Registration 的 client_id 独立，不要混用。
+managed_identity_client_id = ""
+# App Registration 专用：默认引用环境变量，也可在本地配置填写实际租户 ID 和应用 Client ID。
+# 设置 AZURE_TENANT_ID、AZURE_CLIENT_ID 和 AZURE_CLIENT_SECRET 后再运行。
+# auto 缺少这些凭据时跳过该方式；固定 App Registration 模式则会报错。
+tenant_id = "${AZURE_TENANT_ID}"
+client_id = "${AZURE_CLIENT_ID}"
+# 填 Secret 所在的环境变量名，不是 Secret 值；使用 Secret 的值而非 Secret ID。
+# 仅本地临时明文测试时，可删除此项并改用 client_secret = "临时 Secret 值"。
+# client_secret 与 client_secret_env 二选一；为应用授予目标资源的推理权限。
+client_secret_env = "AZURE_CLIENT_SECRET"
+
+[benchmark]
+# 每个模型、协议、响应模式和场景组合的正式测试轮数，必须大于 0。
+rounds = 3
+# true：某轮失败后继续其他测试；失败仍会记入报告，不视为通过。
+continue_on_error = true
+# streaming、non_streaming 或 both；both 交替顺序进行配对比较。
+# 非流式没有可测的 TTFT、TTLT、decode TPS 和客户端 prefill proxy。
+mode = "both"
+# 选择一个或多个场景；仅列出的场景会运行。
+# baseline：使用下方 request 提示词进行基线测试。
+# prefill_short / prefill_long：短/长输入对比；客户端代理指标不是服务端实测 prefill。
+# long_output：要求可见输出超过 1000 token。
+# short_burst：独立短请求连续串行执行；short_conversation：逐次累积对话历史。
+# 两种短输出场景均要求每次可见输出少于 200 token，且不人为插入等待。
+# agent：本地工具调用；agent_serial / agent_parallel：串行/并行子 Agent。
+# Agent 场景需要模型和接口支持工具调用；完整场景列表见中文文档。
+scenarios = ["baseline"]
+# 是否允许顺序请求复用连接；false 用于观察每次重新建连的影响。
+connection_reuse = true
+# 每个组合的完整场景预热轮数，可为 0；预热也调用模型并产生费用。
+warmup_rounds = 1
+# 一轮场景的任务时限，单位秒；批量短请求和 Agent 的整轮任务共享此时限。
+task_timeout_seconds = 600
+# 留空按被测模型名选择分词器；部署别名可填已确认兼容的底层模型名。
+# 未知分词器会使用标记过的启发式估算，不能据此判定严格输出长度通过。
+tokenizer_model = ""
+
+[scenarios]
+# 每轮 short_burst / short_conversation 连续执行的请求数。
+short_requests = 20
+# 短输出场景每次请求的生成预算，可能包含隐藏推理；不等于可见输出长度。
+# 1024 的预算不意味着允许输出超过 200 个可见 token；最终按实际输出校验。
+short_token_budget = 1024
+# 长输出场景的生成预算；设置较大上限不能保证实际可见输出超过 1000 token。
+long_token_budget = 8192
+# prefill_short / prefill_long 的合成输入长度，单位是单词，不是 token。
+prefill_short_words = 128
+prefill_long_words = 4096
+
+[agents]
+# 每个 Agent 各自的最大执行步数，包括主 Agent 和各个子 Agent。
+max_steps = 4
+# 整轮任务的模型调用次数上限，由主 Agent 和所有子 Agent 共享。
+max_calls = 12
+# 每次 Agent 模型请求的生成预算，可能包含隐藏推理和工具调用 token。
+token_budget = 1024
+# 整轮任务共享的生成预算，包含主 Agent 和所有子 Agent。
+total_token_budget = 12288
+
+[request]
+# 所有场景沿用的系统提示词，可按测试需求修改。
+system_prompt = "You are a helpful assistant."
+# baseline 场景的用户提示词；其他场景按自身规则构造输入。
+user_prompt = "Explain how to measure language model latency and throughput."
+# 基线请求的生成预算；可包含隐藏推理，不是保证输出的可见 token 数。
+# 传统 Chat 模型可改用 max_tokens，但两者不能同时设置。
+# Responses 协议会将该值映射为 max_output_tokens。
+max_completion_tokens = 256
+# Chat 流式请求是否要求返回 usage；Responses 从响应对象读取用量。
+include_usage = true

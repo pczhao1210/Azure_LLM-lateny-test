@@ -1,0 +1,6 @@
+[project]
+name = "llm-latency-test"
+version = "0.2.0"
+description = "Streaming, non-streaming, and agent latency benchmarks for Chat Completions"
+requires-python = ">=3.11"
+dependencies = ["tiktoken>=0.14.0,<1", "azure-identity>=1.26.0,<2"]
