@@ -316,6 +316,17 @@ auto 至少有一种鉴权通过**全部所选协议**时退出码为 `0`，其�
 | `request.include_usage` | Chat 流式是否发送 `stream_options.include_usage`；Responses 从响应对象读取用量，不发送此选项 |
 | `headers` | 自定义请求头，值支持 `${ENVIRONMENT_VARIABLE}` 引用 |
 
+示例基线使用 `max_completion_tokens = 2048`。两种 token 上限都未配置时，
+兼容旧模型的 `max_tokens` 默认值也为 2048；显式设置的上限不会被自动提高。
+推理和可见回答共享预算，256 可能在模型开始回答前就耗尽。
+HTTP 200 但 `finish_reason=length` 仍判为失败，分类为 `budget_exhausted`，不是网络或 HTTP 错误。
+
+2048 只是试验起点，不保证成功，提高上限可能增加费用。先仅调整预算，保持提示词、
+推理强度、轮数和连接策略不变；确认所有部署支持后，再单独测试 `reasoning_effort = "low"`。
+通过提示词要求简短回答，不要用过小预算强行截断；严格长短场景仍校验实际可见输出。
+不要为通过校验随意指定 tokenizer。先稳定负载，再增加样本量；少量样本的 P95 仍仅供描述。
+程序不会自动重试、自动提高预算或额外探测真实模型。
+
 不要同时设置 `llm.api_key` 和 `llm.api_key_env`；推荐只使用环境变量配置。
 
 对于 Azure 风格的 `api-key` 请求头，可采用下面的配置片段，并在环境中设置
@@ -633,11 +644,14 @@ API completion 总量单独存入 `api_completion_tokens`；`generation_duration
 导出本身也不会额外调用模型，但上面的正常运行和在线验证仍有原本的调用费用。
 
 报告包含：协议/模式延迟和吞吐汇总、成功配对差异、正式轮次与预热、Agent 逐次调用和任务计时、
-可见/API/推理/缓存 token、计数来源及完整性、失败和长度验证原因、带来源的服务端原始计时，以及指标说明。
+可见/API/推理/缓存 token、计数来源及完整性、失败分类与失败调用用量、长度验证原因、
+带来源的服务端原始计时，以及指标说明。
 访问验证报告则包含鉴权结果、逐项探测、脱敏错误和 request ID。
 Markdown 面向测量和诊断对比，不嵌入完整生成回答或加密推理历史；需要原始完整结果时同时保存 JSON。
 
 汇总单元格为“均值 / P50 / P95 (n=有效测量样本数)”。`n/a` 表示不可观测或缺失，不是零。
+每个组合同时展示 **All completed**（含已完成但验证失败的样本）和 **Successful only**（仅成功样本）。
+Measurement Warnings 会标明启发式 token 估算；其吞吐率不能与已知分词器的结果严格比较。
 预热不混入正式汇总；少于 20 个样本的 P95 仅供描述。任务累计 token 包含子调用，
 不能将任务行与子调用行重复相加。不完整计数只代表已观测部分，不能当作完整计费用量。
 Prefill proxy 仍是客户端代理指标，不是实测服务端 prefill。
@@ -676,6 +690,10 @@ JSONL 每行是独立 JSON 对象，结构为 `schema_version`、已去除查询
 | `runs` | 每轮正式测试，包括指标、token 数、输出内容和验证结果 |
 | `warmup_runs` | 预热记录，不参与正式样本分位数统计 |
 | `summaries` | 按模型、场景、协议和模式分组的均值、最小值、最大值、P50、P95、样本数与成功率 |
+| `summaries[].successful_metrics` | 与原 `metrics` 并存的仅成功、未中断样本统计，原口径不变 |
+| `summaries[].token_count_sources` / `token_count_note` | 可见 token 计数来源及启发式估算警告 |
+| `failure_summary` | 正式/预热分别统计失败分类与失败调用用量；各分组也有独立汇总 |
+| `settings.max_tokens` / `max_completion_tokens` / `reasoning_effort` | 基线预算及推理强度配置；推理强度为 `null` 表示采用模型默认值 |
 | `endpoints` | 各协议自动补全后的端点，不含查询字符串 |
 | `comparisons` | `both` 模式下，成功轮次的配对差异 |
 | `metric_notes` | 指标口径及兼容性说明 |
@@ -690,6 +708,19 @@ JSONL 每行是独立 JSON 对象，结构为 `schema_version`、已去除查询
 没有观测值的失败请求不会虚构指标。少于 20 个样本时，P95 仅供描述，不宜作为稳定性能结论。
 重复输入可能命中服务端缓存，应同时查看 `cached_input_tokens`，不能假定每次都是冷缓存。
 
+失败记录的 `failure_category` 区分 `budget_exhausted`（生成预算耗尽）、`empty_output`（空回答）、
+`length_violation`（可见长度不合格）、`length_unverified`（分词器未知，无法严格验证）、
+`abnormal_finish`（其他非正常结束）、`authentication_error`（取凭据失败）、`http_error`、
+`transport_error`、`response_error`（响应格式错误）、`interrupted_response`（响应读取/解析未完成）
+和 `task_error`（任务执行失败）。任务采用首个失败调用的分类；仅本地任务失败时为 `task_error`。
+其他原因仍保留在逐次调用中；缺少分类的旧记录显示 `unclassified`，不通过错误文本猜测。
+
+`failure_summary.categories` 按失败/未验证轮次计数，`failed_calls` 和 `tokens` 只统计失败的独立
+模型调用，不重复加上任务累计值，也不将失败任务中已成功的中间调用算作失败调用用量。
+各 token 字段包含 `observed_total`（已有计数之和）、`reported_calls`（有该计数的调用数）
+和 `complete`（缺少计数或响应中断时为 `false`）。完全缺少计数时为 `null`，不能当成零；
+没有失败调用时才可直接记零。这些值不是金额，也不代表完整账单用量。
+
 即使已收到的内容看起来完整，缺少 `Content-Length` 声明的字节、损坏的 chunked 边界或缺失 SSE
 结束标记都会被判定失败。流式失败保留已完整解析的文本事件、可见 token、TTFT、已收到的 API
 用量/工具片段和服务端计时，无法解码的片段不算可见文本。
@@ -699,7 +730,8 @@ TTLT、解码 TPS、生成时长、单次请求端到端耗时及输出速率为
 观测到文本的时间，不能当成完整响应的 TTLT。
 
 Agent 和短请求批次的顶层耗时、输出速率描述**整个任务**；顶层 TTFT、TTLT、解码 TPS 为 `null`。
-逐次模型调用保存在 `calls` 中，调用统计见 `call_metrics`。
+逐次模型调用保存在 `calls` 中，调用统计见 `call_metrics`；
+新增 `successful_call_metrics` 仅统计其中成功且未中断的调用，原统计口径不变。
 累计可见 token 包括子 Agent 和中间回答，不只是主 Agent 最终回答。
 Agent 最终回答见 `final_answer`，工具记录见 `tools`；本地工具时间与委派时间分别记录，
 委派时间已经包含子模型调用，不能再重复加到任务耗时上。

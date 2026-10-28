@@ -24,6 +24,7 @@ import tempfile
 import threading
 import time
 import tomllib
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -334,7 +335,7 @@ def load_config(config_path: Path, *, require_credentials: bool = True) -> Bench
             "Set only one of request.max_tokens or request.max_completion_tokens."
         )
     if max_tokens is None and max_completion_tokens is None:
-        max_tokens = 256
+        max_tokens = 2048
 
     extra_headers: dict[str, str] = {}
     for header_name, value in headers.items():
@@ -1465,6 +1466,7 @@ class RequestSession:
             on_stage("authentication failed")
             raise CallFailure({"model": self.model, "round": round_number, "success": False,
                 "request_success": False, "mode": "streaming" if streaming else "non_streaming",
+                "failure_category": "authentication_error",
                 "error": self.authentication.redact(error), "authentication": self.authentication.details(),
                 "response_complete": False, "interrupted": False, "protocol": config.protocol,
                 "endpoint": display_endpoint(self.endpoint)}) from None
@@ -1558,7 +1560,14 @@ class RequestSession:
                              "end_to_end_ms", "end_to_end_output_tokens_per_second"):
                     record["metrics"][name] = None
                 record["metrics"]["authentication_ms"] = authentication_ms
+            if response is not None and not 200 <= response.status < 300:
+                category = "http_error"
+            elif reading_body:
+                category = "interrupted_response"
+            else:
+                category = "response_error" if response is not None else "transport_error"
             record.update({"success": False, "request_success": False, "error": message,
+                           "failure_category": category,
                            "interrupted": reading_body, "response_complete": False,
                            "http_status": response.status if response is not None else None,
                            "protocol": config.protocol, "endpoint": display_endpoint(self.endpoint),
@@ -1616,6 +1625,7 @@ def build_call_result(
         "round": round_number,
         "mode": "streaming" if streaming else "non_streaming",
         "success": True,
+        "failure_category": None,
         "response_complete": True,
         "interrupted": False,
         "http_status": http_status,
@@ -1715,12 +1725,43 @@ def summarize_metric(records: list[dict[str, Any]], name: str) -> dict[str, floa
     }
 
 
+def summarize_failures(records: list[dict[str, Any]]) -> dict[str, Any]:
+    failures = [record for record in records if not record["success"]]
+    calls = [call for record in records for call in record.get("calls", [record]) if not call["success"]]
+    tokens = {}
+    for name in ("input_tokens", "visible_output_tokens", "api_completion_tokens",
+                 "reasoning_tokens", "cached_input_tokens", "total_tokens"):
+        values = [call.get("tokens", {}).get(name) for call in calls]
+        reported = [value for value in values if value is not None]
+        complete = len(reported) == len(calls) and all(
+            not call.get("interrupted", False)
+            and (name != "visible_output_tokens"
+                 or call.get("tokens", {}).get("visible_output_tokens_complete", True))
+            for call in calls
+        )
+        tokens[name] = {
+            "observed_total": sum(reported) if reported or not calls else None,
+            "reported_calls": len(reported),
+            "complete": complete,
+        }
+    return {
+        "failed_rounds": len(failures),
+        "categories": dict(Counter(record.get("failure_category") or "unclassified" for record in failures)),
+        "failed_calls": len(calls),
+        "tokens": tokens,
+    }
+
+
 def summarize_model(
     model: str, records: list[dict[str, Any]], total_rounds: int
 ) -> dict[str, Any]:
     successes = [record for record in records if record["success"]]
     measured = [record for record in records if "metrics" in record and not record.get("interrupted", False)]
     failures = [record for record in records if not record["success"]]
+    successful_measured = [record for record in measured if record["success"]]
+    token_sources = sorted({call["tokens"]["output_token_count_source"]
+        for record in records for call in record.get("calls", [record])
+        if call.get("tokens", {}).get("output_token_count_source")})
     metrics = {
         name: summarize_metric(measured, name) for name in _METRIC_NAMES
     }
@@ -1732,8 +1773,17 @@ def summarize_model(
         "completed_rounds": len(records),
         "success_rate": round(len(successes) / len(records), 4) if records else None,
         "unverified_rounds": sum(record.get("validation", {}).get("status") == "unverified" for record in records),
-        "percentile_note": "P95 is descriptive only with fewer than 20 samples." if len(measured) < 20 else None,
+        "percentile_note": "P95 is descriptive only with fewer than 20 samples."
+            if len(measured) < 20 or len(successful_measured) < 20 else None,
         "metrics": metrics,
+        "successful_metrics": {name: summarize_metric(successful_measured, name) for name in _METRIC_NAMES},
+        "failure_summary": summarize_failures(records),
+        "token_count_sources": token_sources,
+        "token_count_note": (
+            "Heuristic visible-token counts: token rates are approximate, not directly comparable "
+            "to known-tokenizer rates, and cannot verify strict output lengths."
+            if "estimated" in token_sources else None
+        ),
     }
 
 
@@ -1776,16 +1826,23 @@ def validate_output(record: dict[str, Any], scenario: str) -> None:
     tokens = record["tokens"]["visible_output_tokens"]
     limited = scenario in {"long_output", "short_burst", "short_conversation"}
     status, reason = "passed", "Complete visible response."
+    category = None
     if not record["assistant_message"]["content"].strip():
         status, reason = "failed", "Response contains no visible text."
+        category = "empty_output"
     elif record["finish_reason"] != "stop":
         status, reason = "failed", f"Response did not finish normally: {record['finish_reason']}."
+        category = "abnormal_finish"
     elif limited and record["tokens"]["output_token_count_source"] == "estimated":
         status, reason = "unverified", "Visible-output length requires a known tokenizer or explicit tokenizer_model."
+        category = "length_unverified"
     elif scenario == "long_output" and tokens <= 1000:
         status, reason = "failed", f"Long output requires >1000 visible tokens; received {tokens}."
+        category = "length_violation"
     elif scenario in {"short_burst", "short_conversation"} and tokens >= 200:
         status, reason = "failed", f"Short output requires <200 visible tokens; received {tokens}."
+        category = "length_violation"
+    record["failure_category"] = "budget_exhausted" if record["finish_reason"] == "length" else category
     record["request_success"] = True
     record["validation"] = {"status": status, "reason": reason}
     record["success"] = status == "passed"
@@ -1816,15 +1873,21 @@ def aggregate_calls(model: str, round_number: int, mode: str,
     unverified = any(call.get("validation", {}).get("status") == "unverified" for call in calls)
     interrupted = any(call.get("interrupted", False) for call in calls)
     success = bool(calls) and all(call["success"] for call in calls) and error is None
-    reason = error or next((call.get("error", "Call failed.") for call in calls if not call["success"]), "All calls passed.")
+    failed_call = next((call for call in calls if not call["success"]), None)
+    reason = error or (failed_call.get("error", "Call failed.") if failed_call else "All calls passed.")
     return {
         "model": model, "round": round_number, "mode": mode, "success": success,
+        "failure_category": None if success else
+            (failed_call.get("failure_category") or "unclassified") if failed_call else "task_error",
         "metrics": metrics, "tokens": totals, "calls": calls, "call_count": len(calls),
         "interrupted": interrupted,
         "visible_token_totals_complete": len(measured) == len(calls) and not interrupted,
         "token_totals_complete": bool(calls) and not interrupted and all(totals[name] is not None for name in token_names),
         "validation": {"status": "passed" if success else "unverified" if unverified and not error else "failed", "reason": reason},
         "call_metrics": {name: summarize_metric(measured, name) for name in _METRIC_NAMES},
+        "successful_call_metrics": {
+            name: summarize_metric([call for call in measured if call["success"]], name) for name in _METRIC_NAMES
+        },
         **({"error": reason} if not success else {}),
     }
 
@@ -1855,6 +1918,7 @@ def run_text_scenario(config: BenchmarkConfig, session: RequestSession,
             record = error.record if isinstance(error, CallFailure) else {
                       "model": session.model, "round": round_number, "success": False,
                       "mode": "streaming" if streaming else "non_streaming",
+                      "failure_category": "transport_error" if isinstance(error, (http.client.HTTPException, OSError)) else "task_error",
                       "error": safe_error(error, config)}
             history = history[:1] if effective.system_prompt else []
         record["sequence"] = sequence
@@ -1966,7 +2030,8 @@ def run_agent_loop(config: BenchmarkConfig, session: RequestSession, budget: Age
                                   tools=[tool], tool_choice=choice, deadline=budget.deadline)
         except (BenchmarkError, http.client.HTTPException, OSError) as error:
             failed_call = error.record if isinstance(error, CallFailure) else {
-                "success": False, "error": safe_error(error, config)}
+                "success": False, "error": safe_error(error, config),
+                "failure_category": "transport_error" if isinstance(error, (http.client.HTTPException, OSError)) else "task_error"}
             failed_call.update({"model": session.model, "round": round_number,
                 "mode": "streaming" if streaming else "non_streaming", "agent": role,
                 "step": step, "call_number": call_number, "task_offset_ms": offset_ms})
@@ -1975,6 +2040,9 @@ def run_agent_loop(config: BenchmarkConfig, session: RequestSession, budget: Age
         record.update({"agent": role, "step": step, "call_number": call_number,
                        "task_offset_ms": offset_ms, "reserved_completion_tokens": tokens})
         budget.append_call(record)
+        if record["finish_reason"] == "length":
+            validate_output(record, "baseline")
+            raise BenchmarkError(record["error"])
         message = record["assistant_message"]
         tool_calls = message.get("tool_calls") or []
         if not tool_calls:
@@ -2349,11 +2417,14 @@ def build_result(
         "comparisons": build_comparisons(config, records),
         "warmup_runs": warmups or [],
         "failed_warmups": sum(not record["success"] for record in warmups or []),
+        "failure_summary": {"measured": summarize_failures(records), "warmup": summarize_failures(warmups or [])},
         "settings": {"mode": config.mode, "scenarios": list(config.scenarios), "protocol": config.protocol,
                      "auth_type": config.auth_type,
                      "auth_order": list(_AUTH_CHAIN) if config.auth_type == "auto" else [config.auth_type],
                      "connection_reuse": config.connection_reuse, "warmup_rounds": config.warmup_rounds,
-                     "tokenizer_model": config.tokenizer_model or "automatic", "automatic_retries": False},
+                     "tokenizer_model": config.tokenizer_model or "automatic", "automatic_retries": False,
+                     "max_tokens": config.max_tokens, "max_completion_tokens": config.max_completion_tokens,
+                     "reasoning_effort": config.reasoning_effort},
         "metric_notes": {
             "protocol": "Chat Completions and Responses use separate sessions and summaries. Mode comparisons pair only matching protocols. Responses is stateless (store=false); input history includes returned reasoning/tool items.",
             "tcp_connect_ms": "Total TCP attempt time, including failed addresses; all attempts and TLS share the request deadline. Synchronous OS DNS resolution cannot be forcibly cancelled.",
@@ -2364,6 +2435,10 @@ def build_result(
             "end_to_end_output_tokens_per_second": "Visible output tokens / wall time; comparable across response modes.",
             "task_metrics": "Batch/agent top-level latency and output rate cover the whole task; call_metrics contain individual LLM statistics.",
             "token_counts": "output_tokens now counts visible text only; api_completion_tokens preserves provider totals separately.",
+            "successful_metrics": "Existing metrics include completed validation failures. successful_metrics and successful_call_metrics include only successful, non-interrupted observations; warmups remain separate.",
+            "failure_categories": "Round categories use the first failed call for tasks, or task_error for a task-only failure. Inspect individual calls for additional causes. Missing legacy categories are unclassified.",
+            "failed_call_tokens": "Only failed individual LLM calls are counted, not task totals or successful intermediate calls. observed_total is the sum of available counts, not a billing estimate; missing counts or interruptions make complete=false.",
+            "generation_budget": "Reasoning and visible output share the generation cap. HTTP 200 with finish_reason=length is budget_exhausted, not a transport error. A larger cap may increase cost; low reasoning effort requires model support.",
             "server_timing": "Raw provider timing retained with source; no provider-independent prefill semantics assumed.",
             "interrupted": "Partial text/tokens and observed TTFT are retained. TTLT and full-response rates are null; interrupted runs are excluded from metric summaries and comparisons.",
             "authentication_ms": "Token provider time, including cache/refresh and lock waiting; excluded from individual model request timing. Task wall time includes authentication; task authentication_ms sums call values.",
@@ -2411,7 +2486,9 @@ def render_markdown(result: dict[str, Any]) -> str:
             ["Response mode", settings.get("mode")], ["Configured rounds per combination", result.get("configured_rounds")],
             ["Recorded measured rounds", result.get("completed_runs")], ["Failed measured rounds", result.get("failed_runs")],
             ["Recorded warmups", len(result.get("warmup_runs", []))], ["Failed warmups", result.get("failed_warmups")],
-            ["Connection reuse", settings.get("connection_reuse")], ["Tokenizer selection", settings.get("tokenizer_model")]])
+            ["Connection reuse", settings.get("connection_reuse")], ["Tokenizer selection", settings.get("tokenizer_model")],
+            ["Baseline generation budget", settings.get("max_completion_tokens") or settings.get("max_tokens")],
+            ["Reasoning effort", settings.get("reasoning_effort") or "model default"]])
     sections.extend(["## Overview", markdown_table(["Setting", "Value"], overview)])
     if validation:
         methods = result.get("auth_results")
@@ -2448,12 +2525,24 @@ def render_markdown(result: dict[str, Any]) -> str:
     ):
         rows = []
         for summary in result.get("summaries", []):
-            rows.append([summary["model"], summary["scenario"], summary.get("protocol", "chat_completions"), summary["mode"],
-                f"{summary['successful_rounds']}/{summary['completed_rounds']}/{summary['total_rounds']}",
-                *[markdown_statistics(summary["metrics"].get(name)) for name, _ in columns]])
-        sections.extend(["## " + title, "Metric cells: average / P50 / P95 (n = measured samples).",
-            markdown_table(["Model", "Scenario", "Protocol", "Mode", "Passed / Recorded / Configured",
+            for key, sample_set in (("metrics", "All completed"), ("successful_metrics", "Successful only")):
+                rows.append([summary["model"], summary["scenario"], summary.get("protocol", "chat_completions"), summary["mode"],
+                    sample_set, f"{summary['successful_rounds']}/{summary['completed_rounds']}/{summary['total_rounds']}",
+                    *[markdown_statistics(summary.get(key, {}).get(name)) for name, _ in columns]])
+        sections.extend(["## " + title, "Metric cells: average / P50 / P95 (n = measured samples). "
+            "All completed retains validation failures; Successful only excludes them. Neither includes interrupted samples or warmups.",
+            markdown_table(["Model", "Scenario", "Protocol", "Mode", "Sample Set", "Passed / Recorded / Configured",
                             *[label for _, label in columns]], rows)])
+    warnings = []
+    for summary in result.get("summaries", []):
+        notes = [summary.get("percentile_note"), summary.get("token_count_note")]
+        if any(notes):
+            warnings.append([summary["model"], summary["scenario"], summary.get("protocol", "chat_completions"),
+                summary["mode"], ", ".join(summary.get("token_count_sources", [])) or "unavailable",
+                " ".join(note for note in notes if note)])
+    if warnings:
+        sections.extend(["## Measurement Warnings", markdown_table(
+            ["Model", "Scenario", "Protocol", "Mode", "Token Count Sources", "Warning"], warnings)])
     comparison_rows = []
     for comparison in result.get("comparisons", []):
         for name, statistics in comparison["deltas"].items():
@@ -2514,16 +2603,34 @@ def render_markdown(result: dict[str, Any]) -> str:
             tokens.get("output_token_count_source"), record.get("visible_token_totals_complete", tokens.get("visible_output_tokens_complete"))])
         if not record["success"]:
             failure_rows.append([*scope, label, state(record), record.get("http_status"), record.get("finish_reason"),
-                record.get("validation", {}).get("status"), record.get("error", record.get("validation", {}).get("reason"))])
+                record.get("failure_category") or "unclassified", record.get("validation", {}).get("status"),
+                record.get("error", record.get("validation", {}).get("reason"))])
         if record.get("server_timing"):
             timing = record["server_timing"]
             server_rows.append([*scope, label, timing.get("source"), json.dumps(timing.get("raw"), ensure_ascii=False)])
-    sections.extend(["## Token Accounting",
+    category_rows = []
+    failed_token_rows = []
+    for phase, summary in result.get("failure_summary", {}).items():
+        category_rows.extend([[phase, category, count] for category, count in summary["categories"].items()])
+        if summary["failed_calls"]:
+            failed_token_rows.extend([[phase, summary["failed_calls"], name, usage["observed_total"],
+                usage["reported_calls"], usage["complete"]] for name, usage in summary["tokens"].items()])
+    sections.extend(["## Failure Summary",
+        "Counts are failed/unverified rounds, not HTTP error counts. Tasks use their first failed call's category; "
+        "inspect call rows for other causes. budget_exhausted can occur with HTTP 200 before any visible text.",
+        markdown_table(["Phase", "Category", "Failed Rounds"], category_rows) if category_rows else "No failed or unverified rounds.",
+        "## Failed Call Token Usage",
+        "Only failed individual LLM calls are counted, once each; successful intermediate calls in failed tasks are excluded. "
+        "Observed totals are available counts, not billing totals. Missing counts or interrupted responses make Complete false. "
+        "Visible counts retain their tokenizer/heuristic source in Token Accounting.",
+        markdown_table(["Phase", "Failed Calls", "Token Type", "Observed Total", "Calls With Count", "Complete"], failed_token_rows)
+        if failed_token_rows else "No failed LLM calls.",
+        "## Token Accounting",
         "Visible text is separate from API output/reasoning/tool tokens. Task totals include children/intermediate outputs; "
         "do not sum task rows with their call rows. Incomplete visible totals are observed portions, not full output or billing totals.",
         markdown_table([*scope_headers, "Scope / Call", "Visible", "API Completion", "Reasoning", "Cached Input", "API Total", "Tokenizer / Source", "Visible Complete"], token_rows),
         "## Failures And Length Validation",
-        markdown_table([*scope_headers, "Scope / Call", "Result", "HTTP", "Finish Reason", "Validation", "Reason"], failure_rows)
+        markdown_table([*scope_headers, "Scope / Call", "Result", "HTTP", "Finish Reason", "Category", "Validation", "Reason"], failure_rows)
         if failure_rows else "No failed or unverified records."])
     if server_rows:
         sections.extend(["## Provider Timing Metadata",
@@ -2531,7 +2638,7 @@ def render_markdown(result: dict[str, Any]) -> str:
             markdown_table([*scope_headers, "Scope / Call", "Source", "Raw Metadata"], server_rows)])
     notes = {"Unavailable values": "n/a means unavailable, not zero. Non-streaming TTFT, TTLT, decode TPS and prefill proxy are unobservable.",
         "Percentiles": "P95 with fewer than 20 samples is descriptive only; inspect each metric's n before drawing conclusions.",
-        "Sample inclusion": "Warmups are excluded from measured summaries. Completed length-invalid samples retain metrics, but are excluded from successful pairs. Interrupted samples are excluded from metric summaries.",
+        "Sample inclusion": "Warmups are excluded from measured summaries. All completed retains validation failures; Successful only and successful pairs exclude them. Interrupted samples are excluded from both metric summaries.",
         **result.get("metric_notes", {})}
     sections.extend(["## Metric Definitions And Limitations", markdown_table(["Topic", "Explanation"],
         [[name, note] for name, note in notes.items()])])
@@ -2558,7 +2665,7 @@ def print_human_result(result: dict[str, Any]) -> None:
         if "authentication" in record:
             prefix += f" / auth {record['authentication']['type'] or 'unavailable'}"
         if not record["success"]:
-            print(f"{prefix}: FAIL - {record['error']}")
+            print(f"{prefix}: FAIL [{record.get('failure_category') or 'unclassified'}] - {record['error']}")
             continue
         metrics = record["metrics"]
         tokens = record["tokens"]
@@ -2601,16 +2708,27 @@ def print_human_result(result: dict[str, Any]) -> None:
             ("output_tokens_per_second", "Output throughput", " tokens/s"),
             ("end_to_end_output_tokens_per_second", "End-to-end output rate", " tokens/s"),
         ):
-            values = summary["metrics"][name]
-            if values is None:
-                print(f"    {label}: n/a")
-                continue
-            print(
-                f"    {label}: {values['average']}{unit} / "
-                f"{values['p50']}{unit} / {values['p95']}{unit}"
-            )
+            for key, sample_set in (("metrics", "All completed"), ("successful_metrics", "Successful only")):
+                values = summary.get(key, {}).get(name)
+                if values is None:
+                    print(f"    {label} [{sample_set}]: n/a")
+                    continue
+                print(
+                    f"    {label} [{sample_set}]: {values['average']}{unit} / "
+                    f"{values['p50']}{unit} / {values['p95']}{unit} (n={values['sample_count']})"
+                )
         if summary["percentile_note"]:
             print(f"    Note: {summary['percentile_note']}")
+        if summary.get("token_count_note"):
+            print(f"    Note: {summary['token_count_note']}")
+    for phase, summary in result.get("failure_summary", {}).items():
+        if summary["failed_rounds"]:
+            print(f"  {phase} failure categories: {json.dumps(summary['categories'], sort_keys=True)}")
+        if summary["failed_calls"]:
+            print(f"  Failed call token usage ({phase}, {summary['failed_calls']} calls; observed counts, not billing totals):")
+            for name, usage in summary["tokens"].items():
+                print(f"    {name}: {format_value(usage['observed_total'])}"
+                      f" ({usage['reported_calls']}/{summary['failed_calls']} calls with counts; complete={usage['complete']})")
     for comparison in result["comparisons"]:
         print(f"  Comparison {comparison['model']} / {comparison['scenario']} / {comparison.get('protocol', 'chat_completions')}: {comparison['paired_rounds']} valid pairs")
         for name, values in comparison["deltas"].items():

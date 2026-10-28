@@ -850,6 +850,22 @@ class TransportTests(unittest.TestCase):
                             call = record.get("calls", [record])[0]
                             self.assertIn("assistant_message", call)
 
+    def test_failure_categories_are_recorded_for_both_protocols_and_modes(self):
+        config = make_config(endpoint=f"http://127.0.0.1:{self.server.server_port}/v1",
+                             protocol="both", mode="both")
+        for variant, category in (("http_error", "http_error"), ("truncated", "budget_exhausted"),
+                                  ("interrupted", "interrupted_response")):
+            saved = []
+            with self.subTest(variant=variant), \
+                 patch.object(bench, "resolve_tokenizer", return_value=WordTokenizer()), \
+                 patch.object(MockHandler, "variant", variant):
+                result = bench.run_benchmarks(config, on_record=saved.append)
+            self.assertEqual(saved, result["runs"])
+            self.assertEqual(len(saved), 4)
+            for record in saved:
+                expected = None if variant == "interrupted" and record["mode"] == "non_streaming" else category
+                self.assertEqual(record["failure_category"], expected)
+
     @classmethod
     def setUpClass(cls):
         cls.server = ThreadingHTTPServer(("127.0.0.1", 0), MockHandler)
@@ -1629,6 +1645,24 @@ class ScenarioTests(unittest.TestCase):
         self.assertFalse(record["success"])
         self.assertEqual(record["validation"]["status"], "unverified")
 
+    def test_failure_categories_distinguish_budget_empty_and_length(self):
+        for scenario, text, count, source, finish, category in (
+            ("baseline", "", 0, "estimated", "length", "budget_exhausted"),
+            ("baseline", "partial", 6, "estimated", "length", "budget_exhausted"),
+            ("baseline", "", 0, "estimated", "stop", "empty_output"),
+            ("baseline", "filtered", 1, "estimated", "content_filter", "abnormal_finish"),
+            ("short_burst", "long", 200, "tiktoken:test", "stop", "length_violation"),
+            ("short_burst", "short", 20, "estimated", "stop", "length_unverified"),
+            ("baseline", "complete", 201, "estimated", "stop", None),
+        ):
+            with self.subTest(scenario=scenario, finish=finish, category=category):
+                record = self.make_record(count, source)
+                record.update({"assistant_message": {"content": text}, "finish_reason": finish})
+                bench.validate_output(record, scenario)
+                self.assertEqual(record["failure_category"], category)
+                self.assertTrue(record["request_success"])
+                self.assertEqual(record["success"], category is None)
+
     def test_reasoning_budget_setting_is_preserved(self):
         config = make_config(max_tokens=None, max_completion_tokens=256)
         effective = bench.scenario_config(config, "long_output")
@@ -1760,6 +1794,93 @@ class OutputTests(unittest.TestCase):
                 bench.validate_output(record, "baseline")
                 records.append(record)
         return bench.build_result(config, bench.parse_endpoint(config.endpoint), records)
+
+    def budget_failure(self):
+        record = bench.build_call_result("test", 2, True,
+            bench.Timing(0, completed_at=1),
+            bench.StreamResult("", {"prompt_tokens": 33, "completion_tokens": 256,
+                "completion_tokens_details": {"reasoning_tokens": 256}, "total_tokens": 289},
+                1, finish_reason="length"), WordTokenizer(), 200)
+        record.update({"scenario": "baseline", "protocol": "chat_completions", "warmup": False})
+        bench.validate_output(record, "baseline")
+        return record
+
+    def test_successful_summary_preserves_all_completed_statistics(self):
+        successful = self.benchmark_result()["runs"][0]
+        failed = self.budget_failure()
+        summary = bench.summarize_model("test", [successful, failed], 2)
+        self.assertEqual(summary["metrics"]["end_to_end_ms"]["average"], 2000)
+        self.assertEqual(summary["metrics"]["end_to_end_ms"]["sample_count"], 2)
+        self.assertEqual(summary["successful_metrics"]["end_to_end_ms"]["average"], 3000)
+        self.assertEqual(summary["successful_metrics"]["end_to_end_ms"]["sample_count"], 1)
+        self.assertEqual(summary["failure_summary"]["categories"], {"budget_exhausted": 1})
+        self.assertIsNone(bench.summarize_model("test", [failed], 1)["successful_metrics"]["end_to_end_ms"])
+
+    def test_failed_usage_counts_leaf_calls_once_and_marks_missing_counts(self):
+        successful = self.benchmark_result()["runs"][0]
+        failed = self.budget_failure()
+        unknown = {"success": False, "failure_category": "http_error", "error": "HTTP 429"}
+        task = bench.aggregate_calls("test", 1, "streaming", [successful, failed, unknown], 0)
+        summary = bench.summarize_failures([task])
+        self.assertEqual(task["failure_category"], "budget_exhausted")
+        self.assertEqual(summary["failed_rounds"], 1)
+        self.assertEqual(summary["failed_calls"], 2)
+        self.assertEqual(summary["categories"], {"budget_exhausted": 1})
+        self.assertEqual(summary["tokens"]["api_completion_tokens"],
+            {"observed_total": 256, "reported_calls": 1, "complete": False})
+        self.assertEqual(summary["tokens"]["reasoning_tokens"]["observed_total"], 256)
+        self.assertEqual(task["successful_call_metrics"]["end_to_end_ms"]["sample_count"], 1)
+        self.assertIsNone(bench.summarize_failures([unknown])["tokens"]["api_completion_tokens"]["observed_total"])
+        interrupted = {**failed, "interrupted": True}
+        self.assertFalse(bench.summarize_failures([interrupted])["tokens"]["api_completion_tokens"]["complete"])
+        empty = bench.summarize_failures([])["tokens"]["api_completion_tokens"]
+        self.assertEqual(empty, {"observed_total": 0, "reported_calls": 0, "complete": True})
+
+    def test_reasoning_only_failures_match_reported_budget_consumption(self):
+        failures = [self.budget_failure() for _ in range(19)]
+        failures[-1]["tokens"].update({"visible_output_tokens": 6, "reasoning_tokens": 247})
+        failures[-1]["assistant_message"]["content"] = "partial answer"
+        bench.validate_output(failures[-1], "baseline")
+        summary = bench.summarize_failures(failures)
+        self.assertEqual(summary["categories"], {"budget_exhausted": 19})
+        self.assertEqual(summary["tokens"]["api_completion_tokens"],
+            {"observed_total": 4864, "reported_calls": 19, "complete": True})
+        self.assertEqual(summary["tokens"]["reasoning_tokens"]["observed_total"], 4855)
+        self.assertEqual(summary["tokens"]["visible_output_tokens"]["observed_total"], 6)
+
+    def test_agent_truncation_is_not_misclassified_as_missing_tool_support(self):
+        session = Mock(spec=bench.RequestSession)
+        session.model = "test"
+        session.tokenizer = WordTokenizer()
+        session.call.return_value = self.budget_failure()
+        result = bench.run_agent_scenario(make_config(), session, "agent", 1, True)
+        self.assertFalse(result["success"])
+        self.assertEqual(result["failure_category"], "budget_exhausted")
+        self.assertEqual(result["calls"][0]["failure_category"], "budget_exhausted")
+        self.assertNotIn("Required tool call", result["error"])
+        self.assertEqual(bench.summarize_failures([result])["failed_calls"], 1)
+        session.call.assert_called_once()
+
+    def test_report_separates_warmup_failures_and_warns_about_estimated_tokens(self):
+        config = make_config(rounds=2, max_tokens=None, max_completion_tokens=2048)
+        successful = self.benchmark_result()["runs"][0]
+        successful["tokens"]["output_token_count_source"] = "estimated"
+        failed = self.budget_failure()
+        result = bench.build_result(config, bench.parse_endpoint(config.endpoint), [successful, failed], [failed])
+        self.assertEqual(result["failure_summary"]["measured"]["failed_calls"], 1)
+        self.assertEqual(result["failure_summary"]["warmup"]["failed_calls"], 1)
+        self.assertEqual(result["settings"]["max_completion_tokens"], 2048)
+        self.assertIsNone(result["settings"]["reasoning_effort"])
+        self.assertIn("estimated", result["summaries"][0]["token_count_sources"])
+        self.assertIn("Heuristic", result["summaries"][0]["token_count_note"])
+        markdown = bench.render_markdown(result)
+        for text in ("Successful only", "All completed", "## Failure Summary", "budget\\_exhausted",
+                     "## Failed Call Token Usage", "Calls With Count", "## Measurement Warnings", "Heuristic"):
+            self.assertIn(text, markdown)
+        with patch.object(sys, "stdout", new_callable=io.StringIO) as output:
+            bench.print_human_result(result)
+        for text in ("Successful only", "budget_exhausted", "Failed call token usage", "Heuristic"):
+            self.assertIn(text, output.getvalue())
 
     def test_markdown_benchmark_tables_preserve_protocols_statistics_and_caveats(self):
         result = self.benchmark_result()
@@ -2014,6 +2135,19 @@ class OutputTests(unittest.TestCase):
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_baseline_budget_defaults_and_explicit_limits(self):
+        default = self.load_document(require_credentials=False)
+        self.assertEqual(default.max_tokens, 2048)
+        self.assertIsNone(default.max_completion_tokens)
+        self.assertIsNone(default.reasoning_effort)
+        for name in ("max_tokens", "max_completion_tokens"):
+            config = self.load_document(request=f"{name}=256", require_credentials=False)
+            self.assertEqual(getattr(config, name), 256)
+        for name in ("config.example.EN.toml", "config.example.CN.toml"):
+            config = bench.load_config(Path(__file__).resolve().parents[1] / name, require_credentials=False)
+            self.assertEqual(config.max_completion_tokens, 2048)
+            self.assertIsNone(config.reasoning_effort)
+
     def test_protocol_config_and_offline_endpoint_resolution(self):
         for protocol in bench._PROTOCOLS:
             with self.subTest(protocol=protocol):

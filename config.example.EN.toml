@@ -100,6 +100,10 @@ user_prompt = "Explain how to measure language model latency and throughput."
 # Baseline generation budget; may include hidden reasoning and does not guarantee visible output length.
 # Traditional Chat models may use max_tokens instead, but never set both options.
 # Responses maps this setting to max_output_tokens.
-max_completion_tokens = 256
+# 2048 is a starting point, not a guarantee; raise it if reasoning exhausts the budget.
+# A higher cap can increase cost. Keep prompts and budgets identical in paired tests.
+max_completion_tokens = 2048
+# Optional only after confirming model support; leave unset for a budget-only comparison.
+# reasoning_effort = "low"
 # Request usage in Chat streaming responses; Responses reads usage from the response object.
 include_usage = true

@@ -198,11 +198,14 @@ alongside JSON/JSONL:
 
 Benchmark tables cover protocol/mode latency and throughput summaries, paired
 mode differences, recorded rounds/warmups, individual agent calls, task timing,
-token accounting/completeness, failures/length validation, and provider timing
+token accounting/completeness, failure categories and failed-call usage, length validation, and provider timing
 metadata with its source. Metric explanations and limitations are included.
 Summary cells show average / P50 / P95 and their own measured sample count;
+each summary has both **All completed** and **Successful only** rows.
 `n/a` means unavailable, never zero. Task totals must not be summed with their
 child-call rows. Small-sample P95 and client-prefill-proxy caveats remain explicit.
+Heuristic token counts are flagged in Measurement Warnings; their rates are
+approximate and cannot be compared strictly with known-tokenizer rates.
 Access reports include ordered authentication results, probes, HTTP errors and
 request IDs. Markdown focuses on measurements/diagnostics, not full generated
 answers or encrypted reasoning histories; use JSON for the complete raw report.
@@ -429,6 +432,26 @@ execute the entire selected workload and incur the same cost as measured rounds.
 The 16-call example above assumes one protocol; both protocols make 32 calls
 with those same two-model settings.
 
+### Generation Budget And Reasoning
+
+The example baseline budget is `request.max_completion_tokens = 2048`.
+If neither token-limit option is supplied, the legacy `max_tokens` default is
+also 2048; explicit limits are never increased automatically. Responses maps
+either option to `max_output_tokens`. The cap covers hidden reasoning as well
+as visible output, so 256 tokens can be exhausted before any answer appears.
+HTTP 200 with `finish_reason=length` remains a failed benchmark, classified as
+`budget_exhausted`, rather than an HTTP or connection failure.
+
+2048 is a starting point, not a guarantee. A higher cap can increase cost.
+First compare budgets with prompts, reasoning effort, rounds, and connection
+policy unchanged. Only after verifying support on every selected deployment,
+try `request.reasoning_effort = "low"` in a separate experiment. Use prompts to
+request concise answers instead of truncating them with a tiny generation cap;
+actual visible length is still validated for strict short/long scenarios.
+Do not set an arbitrary tokenizer to make length checks pass. Stabilize the
+workload before increasing sample counts; small-sample P95 remains descriptive.
+There are no automatic retries, budget escalation, or extra model probes.
+
 ## Measurement Contract
 
 | Metric | Streaming | Non-streaming |
@@ -503,6 +526,31 @@ paired comparisons exclude them. Interrupted responses (and task runs containing
 them) are excluded from metric summaries and successful comparisons; observed
 partial timings remain in the individual records. Failures without observations
 have no fabricated timings.
+
+The existing `summaries[].metrics` inclusion policy is unchanged.
+`summaries[].successful_metrics` adds the same statistics restricted to successful
+non-interrupted rounds; `successful_call_metrics` does the same for task calls.
+Token count sources and heuristic warnings are available as `token_count_sources`
+and `token_count_note` in each summary. Request budgets and configured reasoning
+effort are retained in `settings` (null effort means the model default).
+
+Each failed record has a `failure_category`: `budget_exhausted`, `empty_output`,
+`length_violation`, `length_unverified`, `abnormal_finish`, `authentication_error`,
+`http_error`, `transport_error`, `response_error`, `interrupted_response`, or
+`task_error`. Tasks inherit the first failed call's category, or `task_error`
+when only local task execution fails; inspect all call rows for other causes.
+Legacy records without a category are reported as `unclassified`, not guessed
+from error text.
+
+`failure_summary` separates measured and warmup failures; each grouped summary
+also has its own `failure_summary`. `categories` counts failed/unverified rounds,
+while `failed_calls` and `tokens` count failed individual calls only, without
+double-counting tasks or charging successful intermediate calls to failed-call
+usage. For each token field, `observed_total` sums available counts,
+`reported_calls` counts calls with that field, and `complete` is false if counts
+are missing or a response was interrupted. No available counts means null,
+not zero; zero is valid when there were no failed calls. These are observed
+counts, not monetary costs or complete billing totals.
 
 ## Agent And Batch Results
 

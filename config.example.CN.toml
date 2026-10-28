@@ -100,6 +100,10 @@ user_prompt = "Explain how to measure language model latency and throughput."
 # 基线请求的生成预算；可包含隐藏推理，不是保证输出的可见 token 数。
 # 传统 Chat 模型可改用 max_tokens，但两者不能同时设置。
 # Responses 协议会将该值映射为 max_output_tokens。
-max_completion_tokens = 256
+# 2048 只是起点，不保证成功；推理仍耗尽预算时需继续调整。
+# 提高上限可能增加费用；配对测试应保持提示词和预算一致。
+max_completion_tokens = 2048
+# 确认所有被测模型支持后再启用；仅验证预算调整时保持未设置。
+# reasoning_effort = "low"
 # Chat 流式请求是否要求返回 usage；Responses 从响应对象读取用量。
 include_usage = true
